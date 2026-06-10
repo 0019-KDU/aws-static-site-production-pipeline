@@ -1,0 +1,84 @@
+name: Deploy to S3 + CloudFront
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:        # allow manual runs from the Actions tab
+
+# Only one production deploy at a time; newer pushes cancel older runs.
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
+
+permissions:
+  id-token: write           # required for AWS OIDC
+  contents: read
+
+jobs:
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      AWS_REGION:         ${{ secrets.AWS_REGION }}
+      S3_BUCKET:          ${{ secrets.S3_BUCKET }}
+      CLOUDFRONT_DIST_ID: ${{ secrets.CLOUDFRONT_DIST_ID }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_IAM_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Long cache for static assets (immutable) — everything except HTML.
+      - name: Sync assets to S3 (long cache)
+        run: |
+          aws s3 sync . s3://"$S3_BUCKET" \
+            --delete \
+            --exclude ".git/*" \
+            --exclude ".github/*" \
+            --exclude "docs/*" \
+            --exclude "README.md" \
+            --exclude "*.html" \
+            --cache-control "public,max-age=31536000,immutable"
+
+      # Short/no cache for HTML so visitors always get the latest page.
+      - name: Sync HTML to S3 (no cache)
+        run: |
+          aws s3 sync . s3://"$S3_BUCKET" \
+            --exclude "*" \
+            --include "*.html" \
+            --exclude ".git/*" \
+            --exclude ".github/*" \
+            --cache-control "no-cache,must-revalidate" \
+            --content-type "text/html; charset=utf-8"
+
+      - name: Invalidate CloudFront cache
+        if: env.CLOUDFRONT_DIST_ID != ''
+        run: |
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "$CLOUDFRONT_DIST_ID" \
+            --paths "/*" \
+            --query 'Invalidation.Id' --output text)
+          echo "Created invalidation $INVALIDATION_ID — waiting for completion..."
+          aws cloudfront wait invalidation-completed \
+            --distribution-id "$CLOUDFRONT_DIST_ID" \
+            --id "$INVALIDATION_ID"
+
+      - name: Deployment summary
+        run: |
+          {
+            echo "### ✅ Deployment complete"
+            echo ""
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| Bucket | \`$S3_BUCKET\` |"
+            echo "| Region | \`$AWS_REGION\` |"
+            echo "| CloudFront | \`${CLOUDFRONT_DIST_ID:-not set}\` |"
+            echo "| Commit | \`${GITHUB_SHA::7}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
